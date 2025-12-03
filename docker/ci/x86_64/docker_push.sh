@@ -4,7 +4,7 @@ DOCKER_TAGS=""
 
 for TAG in "$@"
 do
-	DOCKER_TAGS="$DOCKER_TAGS -t stashapp/stash:$TAG"
+	DOCKER_TAGS="$DOCKER_TAGS -t milindpatel63/stash:$TAG"
 done
 
 echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
