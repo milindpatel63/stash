@@ -7,17 +7,24 @@ import (
 	"time"
 )
 
+// activeStream tracks an active stream with its context and start time.
+type activeStream struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	startTime time.Time
+}
+
 // pendingRequest tracks a pending request waiting for debounce period.
 type pendingRequest struct {
 	cancel context.CancelFunc
 }
 
 // StreamLimiter limits the number of concurrent file streams per file path.
-// Uses a blocking semaphore to prevent file opens until a slot is available,
-// and debouncing to cancel old requests when new ones arrive rapidly.
+// When at limit, new requests immediately cancel the oldest active stream.
+// Also uses debouncing to handle rapid seeks.
 type StreamLimiter struct {
-	// semaphores: buffered channels acting as semaphores per file path
-	semaphores map[string]chan struct{}
+	// activeStreams: tracks currently active streams per file path
+	activeStreams map[string][]*activeStream
 	// pendingRequests: tracks pending requests per file path for debouncing
 	pendingRequests map[string]*pendingRequest
 	mutex           sync.RWMutex
@@ -31,35 +38,37 @@ func NewStreamLimiter(maxConcurrent int) *StreamLimiter {
 		maxConcurrent = 3 // default to 3 concurrent streams
 	}
 	return &StreamLimiter{
-		semaphores:      make(map[string]chan struct{}),
+		activeStreams:   make(map[string][]*activeStream),
 		pendingRequests: make(map[string]*pendingRequest),
 		maxConcurrent:   maxConcurrent,
 		debounceDelay:   time.Second, // Wait 1 second for debouncing
 	}
 }
 
-// getOrCreateSemaphore returns a semaphore channel for the given file path.
-func (sl *StreamLimiter) getOrCreateSemaphore(filePath string) chan struct{} {
-	sl.mutex.RLock()
-	sem, exists := sl.semaphores[filePath]
-	sl.mutex.RUnlock()
-
-	if exists {
-		return sem
+// cancelOldestActiveStream cancels the oldest active stream for the given file path.
+// Must be called with write lock held.
+func (sl *StreamLimiter) cancelOldestActiveStream(filePath string) {
+	streams := sl.activeStreams[filePath]
+	if len(streams) == 0 {
+		return
 	}
 
-	sl.mutex.Lock()
-	defer sl.mutex.Unlock()
-
-	// Double-check after acquiring write lock
-	if sem, exists := sl.semaphores[filePath]; exists {
-		return sem
+	// Find the oldest stream (earliest startTime)
+	oldestIdx := 0
+	oldestTime := streams[0].startTime
+	for i, stream := range streams {
+		if stream.startTime.Before(oldestTime) {
+			oldestTime = stream.startTime
+			oldestIdx = i
+		}
 	}
 
-	// Create new buffered channel (acts as semaphore)
-	sem = make(chan struct{}, sl.maxConcurrent)
-	sl.semaphores[filePath] = sem
-	return sem
+	// Cancel the oldest stream immediately - this stops its file I/O
+	oldest := streams[oldestIdx]
+	oldest.cancel()
+
+	// Remove it from the list
+	sl.activeStreams[filePath] = append(streams[:oldestIdx], streams[oldestIdx+1:]...)
 }
 
 // waitForDebounce waits for the debounce period, cancelling old pending requests if a new one arrives.
@@ -100,41 +109,95 @@ func (sl *StreamLimiter) waitForDebounce(ctx context.Context, filePath string) b
 	}
 }
 
-// ServeFileWithLimit serves a file with concurrent stream limiting and debouncing.
-// 1. Waits for debounce period (1s) - if new request comes, cancels this one
-// 2. Acquires semaphore slot (blocks if all 3 slots are in use)
-// 3. Serves the file
-// 4. Releases semaphore slot when done
-func (sl *StreamLimiter) ServeFileWithLimit(ctx context.Context, w http.ResponseWriter, r *http.Request, filePath string) bool {
-	// Step 1: Debounce - wait 1 second, cancel if new request comes
-	if !sl.waitForDebounce(ctx, filePath) {
-		// We were cancelled by a new request
-		return false
+// registerActiveStream registers a stream as active and returns its context and cleanup function.
+func (sl *StreamLimiter) registerActiveStream(ctx context.Context, filePath string) (streamCtx context.Context, cleanup func()) {
+	sl.mutex.Lock()
+	defer sl.mutex.Unlock()
+
+	// Create a cancellable context for this stream
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	stream := &activeStream{
+		ctx:       cancelCtx,
+		cancel:    cancel,
+		startTime: time.Now(),
 	}
 
-	// Step 2: Acquire semaphore slot (blocks if all slots are in use)
-	// This prevents file opens until a slot is available
-	sem := sl.getOrCreateSemaphore(filePath)
+	streams := sl.activeStreams[filePath]
 
-	select {
-	case sem <- struct{}{}:
-		// Slot acquired, now we can safely open the file
-		defer func() {
-			// Release slot when done
-			select {
-			case <-sem:
-			default:
-				// Channel already empty, shouldn't happen but safe to ignore
+	// If we're at the limit, cancel the oldest stream immediately
+	if len(streams) >= sl.maxConcurrent {
+		sl.cancelOldestActiveStream(filePath)
+		// Re-fetch after cancellation
+		streams = sl.activeStreams[filePath]
+	}
+
+	// Add the new stream
+	sl.activeStreams[filePath] = append(streams, stream)
+
+	// Return the stream context and cleanup function
+	return cancelCtx, func() {
+		sl.mutex.Lock()
+		defer sl.mutex.Unlock()
+
+		// Remove this stream from the list
+		streams := sl.activeStreams[filePath]
+		for i, s := range streams {
+			if s == stream {
+				sl.activeStreams[filePath] = append(streams[:i], streams[i+1:]...)
+				break
 			}
-		}()
+		}
 
-		// Step 3: Serve the file - will return when complete or client disconnects
-		http.ServeFile(w, r, filePath)
-		return true
-
-	case <-ctx.Done():
-		// Context cancelled before we could acquire a slot
-		return false
+		// Clean up empty entries
+		if len(sl.activeStreams[filePath]) == 0 {
+			delete(sl.activeStreams, filePath)
+		}
 	}
+}
+
+// ServeFileWithLimit serves a file with concurrent stream limiting and debouncing.
+// 1. If at limit, immediately cancel oldest stream (skip debounce for responsiveness)
+// 2. If not at limit, wait for debounce period (1s) - helps with rapid seeks
+// 3. Register as active stream
+// 4. Serve the file
+// 5. Unregister when done
+func (sl *StreamLimiter) ServeFileWithLimit(ctx context.Context, w http.ResponseWriter, r *http.Request, filePath string) bool {
+	sl.mutex.RLock()
+	activeCount := len(sl.activeStreams[filePath])
+	sl.mutex.RUnlock()
+
+	// Step 1: If we're at limit, skip debounce and immediately cancel oldest
+	// This ensures external apps don't get stuck waiting
+	if activeCount >= sl.maxConcurrent {
+		// Cancel oldest immediately to make room
+		sl.mutex.Lock()
+		sl.cancelOldestActiveStream(filePath)
+		sl.mutex.Unlock()
+		// Proceed directly to registration (no debounce when at limit)
+	} else {
+		// Step 1b: Not at limit, use debouncing to handle rapid seeks
+		// Wait 1 second, cancel if new request comes
+		if !sl.waitForDebounce(ctx, filePath) {
+			// We were cancelled by a new request
+			return false
+		}
+	}
+
+	// Step 2: Register as active stream
+	// If we're at limit (shouldn't happen after cancelling oldest, but handle it)
+	streamCtx, cleanup := sl.registerActiveStream(ctx, filePath)
+	defer cleanup()
+
+	// Check if our context was cancelled
+	select {
+	case <-streamCtx.Done():
+		return false
+	default:
+	}
+
+	// Step 3: Serve the file - will return when complete or context is cancelled
+	http.ServeFile(w, r.WithContext(streamCtx), filePath)
+	return true
 }
 
