@@ -51,7 +51,8 @@ func (sl *StreamLimiter) getOrCreateLimiter(filePath string) chan struct{} {
 }
 
 // Acquire attempts to acquire a stream slot for the given file path.
-// Returns true if acquired, false if context is cancelled or limit reached.
+// Waits for a slot to become available if all slots are currently in use.
+// Returns true if acquired, false if context is cancelled.
 func (sl *StreamLimiter) Acquire(ctx context.Context, filePath string) bool {
 	limiter := sl.getOrCreateLimiter(filePath)
 
@@ -79,34 +80,30 @@ func (sl *StreamLimiter) Release(filePath string) {
 }
 
 // ServeFileWithLimit serves a file with concurrent stream limiting.
-// It acquires a stream slot, serves the file, then releases the slot.
-// The slot is released when the file serving completes OR when the request context is cancelled
-// (e.g., when external apps disconnect), ensuring slots are always freed.
+// It waits for a slot if needed, serves the file, then releases the slot.
+// Works for both Stash UI and external apps - slots are released when http.ServeFile returns.
 func (sl *StreamLimiter) ServeFileWithLimit(ctx context.Context, w http.ResponseWriter, r *http.Request, filePath string) bool {
-	if !sl.Acquire(ctx, filePath) {
+	limiter := sl.getOrCreateLimiter(filePath)
+
+	// Wait for a slot to become available (will block if all slots are in use)
+	// This ensures we respect the limit while allowing waiting requests to proceed
+	// when slots are freed (either by completion or timeout)
+	select {
+	case limiter <- struct{}{}:
+		// Slot acquired, serve the file
+		defer func() {
+			// Release slot when done (either on completion or client disconnect)
+			select {
+			case <-limiter:
+			default:
+				// Channel already empty, shouldn't happen but safe to ignore
+			}
+		}()
+		http.ServeFile(w, r, filePath)
+		return true
+	case <-ctx.Done():
+		// Context cancelled before we could acquire a slot
 		return false
 	}
-
-	// Use sync.Once to ensure we only release once
-	var releaseOnce sync.Once
-	release := func() {
-		releaseOnce.Do(func() {
-			sl.Release(filePath)
-		})
-	}
-
-	// Always release on function exit
-	defer release()
-
-	// Monitor context cancellation in a goroutine to release slot immediately
-	// when client disconnects (important for external apps)
-	go func() {
-		<-ctx.Done()
-		release()
-	}()
-
-	// Serve the file - this will return when complete or client disconnects
-	http.ServeFile(w, r, filePath)
-	return true
 }
 
