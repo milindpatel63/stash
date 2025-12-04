@@ -4,14 +4,23 @@ import (
 	"context"
 	"net/http"
 	"sync"
+	"time"
 )
 
+// activeStream tracks an active stream with its context and start time.
+type activeStream struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	startTime time.Time
+}
+
 // StreamLimiter limits the number of concurrent file streams per file path.
-// This prevents accumulation of file handles when browsers make multiple
-// concurrent range requests during video seeking.
+// When the limit is reached, the oldest stream is cancelled to make room for new ones.
+// This prevents accumulation of file handles when external apps keep opening new streams.
 type StreamLimiter struct {
-	limiters map[string]chan struct{}
-	mutex    sync.RWMutex
+	// activeStreams tracks active streams per file path
+	activeStreams map[string][]*activeStream
+	mutex         sync.RWMutex
 	maxConcurrent int
 }
 
@@ -21,89 +30,103 @@ func NewStreamLimiter(maxConcurrent int) *StreamLimiter {
 		maxConcurrent = 3 // default to 3 concurrent streams
 	}
 	return &StreamLimiter{
-		limiters:      make(map[string]chan struct{}),
+		activeStreams: make(map[string][]*activeStream),
 		maxConcurrent: maxConcurrent,
 	}
 }
 
-// getOrCreateLimiter returns a semaphore channel for the given file path.
-func (sl *StreamLimiter) getOrCreateLimiter(filePath string) chan struct{} {
-	sl.mutex.RLock()
-	limiter, exists := sl.limiters[filePath]
-	sl.mutex.RUnlock()
-
-	if exists {
-		return limiter
+// cancelOldestStream cancels the oldest active stream for the given file path.
+// Must be called with write lock held.
+func (sl *StreamLimiter) cancelOldestStream(filePath string) {
+	streams := sl.activeStreams[filePath]
+	if len(streams) == 0 {
+		return
 	}
 
+	// Find the oldest stream (earliest startTime)
+	oldestIdx := 0
+	oldestTime := streams[0].startTime
+	for i, stream := range streams {
+		if stream.startTime.Before(oldestTime) {
+			oldestTime = stream.startTime
+			oldestIdx = i
+		}
+	}
+
+	// Cancel the oldest stream
+	oldest := streams[oldestIdx]
+	oldest.cancel()
+
+	// Remove it from the list
+	sl.activeStreams[filePath] = append(streams[:oldestIdx], streams[oldestIdx+1:]...)
+}
+
+// registerStream registers an active stream and returns its context and cleanup function.
+// If the limit is reached, the oldest stream is cancelled first.
+func (sl *StreamLimiter) registerStream(ctx context.Context, filePath string) (streamCtx context.Context, cleanup func()) {
 	sl.mutex.Lock()
 	defer sl.mutex.Unlock()
 
-	// Double-check after acquiring write lock
-	if limiter, exists := sl.limiters[filePath]; exists {
-		return limiter
+	// Create a cancellable context for this stream
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	stream := &activeStream{
+		ctx:       cancelCtx,
+		cancel:    cancel,
+		startTime: time.Now(),
 	}
 
-	// Create new buffered channel (acts as semaphore)
-	limiter = make(chan struct{}, sl.maxConcurrent)
-	sl.limiters[filePath] = limiter
-	return limiter
-}
+	streams := sl.activeStreams[filePath]
 
-// Acquire attempts to acquire a stream slot for the given file path.
-// Waits for a slot to become available if all slots are currently in use.
-// Returns true if acquired, false if context is cancelled.
-func (sl *StreamLimiter) Acquire(ctx context.Context, filePath string) bool {
-	limiter := sl.getOrCreateLimiter(filePath)
-
-	select {
-	case limiter <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
+	// If we're at the limit, cancel the oldest stream
+	if len(streams) >= sl.maxConcurrent {
+		sl.cancelOldestStream(filePath)
+		// Re-fetch after cancellation
+		streams = sl.activeStreams[filePath]
 	}
-}
 
-// Release releases a stream slot for the given file path.
-func (sl *StreamLimiter) Release(filePath string) {
-	sl.mutex.RLock()
-	limiter, exists := sl.limiters[filePath]
-	sl.mutex.RUnlock()
+	// Add the new stream
+	sl.activeStreams[filePath] = append(streams, stream)
 
-	if exists {
-		select {
-		case <-limiter:
-		default:
-			// Channel already empty, shouldn't happen but safe to ignore
+	// Return the stream context and cleanup function
+	return cancelCtx, func() {
+		sl.mutex.Lock()
+		defer sl.mutex.Unlock()
+
+		// Remove this stream from the list
+		streams := sl.activeStreams[filePath]
+		for i, s := range streams {
+			if s == stream {
+				sl.activeStreams[filePath] = append(streams[:i], streams[i+1:]...)
+				break
+			}
+		}
+
+		// Clean up empty entries
+		if len(sl.activeStreams[filePath]) == 0 {
+			delete(sl.activeStreams, filePath)
 		}
 	}
 }
 
 // ServeFileWithLimit serves a file with concurrent stream limiting.
-// It waits for a slot if needed, serves the file, then releases the slot.
-// Works for both Stash UI and external apps - slots are released when http.ServeFile returns.
+// When the limit is reached, the oldest active stream is cancelled to make room for the new one.
+// This ensures external apps don't accumulate file handles by continuously opening new streams.
 func (sl *StreamLimiter) ServeFileWithLimit(ctx context.Context, w http.ResponseWriter, r *http.Request, filePath string) bool {
-	limiter := sl.getOrCreateLimiter(filePath)
+	// Register this stream (will cancel oldest if at limit)
+	// Returns the stream's context and cleanup function
+	streamCtx, cleanup := sl.registerStream(ctx, filePath)
+	defer cleanup()
 
-	// Wait for a slot to become available (will block if all slots are in use)
-	// This ensures we respect the limit while allowing waiting requests to proceed
-	// when slots are freed (either by completion or timeout)
+	// Check if our context was cancelled (shouldn't happen immediately, but check anyway)
 	select {
-	case limiter <- struct{}{}:
-		// Slot acquired, serve the file
-		defer func() {
-			// Release slot when done (either on completion or client disconnect)
-			select {
-			case <-limiter:
-			default:
-				// Channel already empty, shouldn't happen but safe to ignore
-			}
-		}()
-		http.ServeFile(w, r, filePath)
-		return true
-	case <-ctx.Done():
-		// Context cancelled before we could acquire a slot
+	case <-streamCtx.Done():
 		return false
+	default:
 	}
+
+	// Serve the file - will return when complete or context is cancelled
+	http.ServeFile(w, r.WithContext(streamCtx), filePath)
+	return true
 }
 
