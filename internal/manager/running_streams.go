@@ -58,7 +58,13 @@ func (s *SceneServer) StreamSceneDirect(scene *models.Scene, w http.ResponseWrit
 	_, filename := filepath.Split(fp)
 	contentDisposition := mime.FormatMediaType("inline", map[string]string{"filename": filename})
 	w.Header().Set("Content-Disposition", contentDisposition)
-	http.ServeFile(w, r, fp)
+
+	// Limit concurrent file opens to prevent accumulation of file handles
+	// when browsers make multiple concurrent range requests during seeking
+	if !GetInstance().StreamLimiter.ServeFileWithLimit(r.Context(), w, r, fp) {
+		// Context cancelled or limit reached
+		return
+	}
 }
 
 func (s *SceneServer) ServeScreenshot(scene *models.Scene, w http.ResponseWriter, r *http.Request) {

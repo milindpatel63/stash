@@ -90,6 +90,7 @@ func Initialize(cfg *config.Config, l *log.Logger) (*Manager, error) {
 
 		JobManager:      initJobManager(cfg),
 		ReadLockManager: fsutil.NewReadLockManager(),
+		StreamLimiter:   fsutil.NewStreamLimiter(3), // Limit to 3 concurrent streams per file
 
 		DownloadStore: NewDownloadStore(),
 

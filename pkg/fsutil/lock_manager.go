@@ -58,7 +58,6 @@ func NewReadLockManager() *ReadLockManager {
 
 // ReadLock adds a pending file read lock for fn to its storage, returning a context and cancel function.
 // Per standard WithCancel usage, cancel must be called when the lock is freed.
-// If there are existing locks for the same file, they are cancelled to prevent accumulation of old streams.
 func (m *ReadLockManager) ReadLock(ctx context.Context, fn string) *LockContext {
 	retCtx, cancel := context.WithCancel(ctx)
 
@@ -75,22 +74,13 @@ func (m *ReadLockManager) ReadLock(ctx context.Context, fn string) *LockContext 
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	// Cancel existing locks for the same file to prevent accumulation of old streams
-	// This is especially important for video seeking where new streams replace old ones
-	existingLocks := m.readLocks[fn]
-	for _, oldLock := range existingLocks {
-		// Cancel old lock asynchronously to avoid blocking
-		go func(lock *LockContext) {
-			lock.Cancel()
-		}(oldLock)
-	}
+	locks := m.readLocks[fn]
 
 	cc := &LockContext{
 		Context: retCtx,
 		cancel:  cancel,
 	}
-	// Replace old locks with the new one
-	m.readLocks[fn] = []*LockContext{cc}
+	m.readLocks[fn] = append(locks, cc)
 
 	go m.waitAndUnlock(fn, cc)
 
