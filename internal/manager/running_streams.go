@@ -47,7 +47,14 @@ func (s *SceneServer) StreamSceneDirect(scene *models.Scene, w http.ResponseWrit
 		return
 	}
 
-	sceneHash := scene.GetHash(config.GetInstance().GetVideoFileNamingAlgorithm())
+	algo := config.GetInstance().GetVideoFileNamingAlgorithm()
+
+	// Cancel any existing streams for this scene before starting a new one.
+	// This ensures that only the most recent request (from Stash UI or external apps)
+	// is actively reading from disk.
+	KillRunningStreams(scene, algo)
+
+	sceneHash := scene.GetHash(algo)
 
 	fp := GetInstance().Paths.Scene.GetStreamPath(scene.Path, sceneHash)
 	streamRequestCtx := ffmpeg.NewStreamRequestContext(w, r)
@@ -55,7 +62,9 @@ func (s *SceneServer) StreamSceneDirect(scene *models.Scene, w http.ResponseWrit
 	// #2579 - hijacking and closing the connection here causes video playback to fail in Safari
 	// We trust that the request context will be closed, so we don't need to call Cancel on the
 	// returned context here.
-	_ = GetInstance().ReadLockManager.ReadLock(streamRequestCtx, fp)
+	// Use the original scene.Path as the read lock key so KillRunningStreams can cancel
+	// any existing direct streams for this scene.
+	_ = GetInstance().ReadLockManager.ReadLock(streamRequestCtx, scene.Path)
 	_, filename := filepath.Split(fp)
 	contentDisposition := mime.FormatMediaType("inline", map[string]string{"filename": filename})
 	w.Header().Set("Content-Disposition", contentDisposition)
