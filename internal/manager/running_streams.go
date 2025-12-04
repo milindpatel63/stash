@@ -5,7 +5,9 @@ import (
 	"errors"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/stashapp/stash/internal/manager/config"
 	"github.com/stashapp/stash/internal/static"
@@ -59,12 +61,29 @@ func (s *SceneServer) StreamSceneDirect(scene *models.Scene, w http.ResponseWrit
 	contentDisposition := mime.FormatMediaType("inline", map[string]string{"filename": filename})
 	w.Header().Set("Content-Disposition", contentDisposition)
 
-	// Limit concurrent file opens to prevent accumulation of file handles
-	// when browsers make multiple concurrent range requests during seeking
-	if !GetInstance().StreamLimiter.ServeFileWithLimit(r.Context(), w, r, fp) {
-		// Context cancelled or limit reached
+	// IO-level limiting: ensure at most N concurrent open file handles per file path.
+	// This applies regardless of who calls /scene/:id/stream (Stash UI or external apps).
+	if limiter := GetInstance().IOLimiter; limiter != nil {
+		limiter.Acquire(fp)
+		defer limiter.Release(fp)
+	}
+
+	// Manually open the file so we control when the handle is acquired and released.
+	f, err := os.Open(fp)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	// Use ServeContent so HTTP Range requests are handled correctly on a single file handle.
+	http.ServeContent(w, r, filename, fi.ModTime(), f)
 }
 
 func (s *SceneServer) ServeScreenshot(scene *models.Scene, w http.ResponseWriter, r *http.Request) {

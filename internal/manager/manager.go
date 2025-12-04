@@ -49,6 +49,7 @@ type Manager struct {
 	JobManager      *job.Manager
 	ReadLockManager *fsutil.ReadLockManager
 	StreamLimiter   *fsutil.StreamLimiter
+	IOLimiter       *fsutil.IOLimiter
 
 	DownloadStore *DownloadStore
 	SessionStore  *session.Store
