@@ -80,12 +80,32 @@ func (sl *StreamLimiter) Release(filePath string) {
 
 // ServeFileWithLimit serves a file with concurrent stream limiting.
 // It acquires a stream slot, serves the file, then releases the slot.
+// The slot is released when the file serving completes OR when the request context is cancelled
+// (e.g., when external apps disconnect), ensuring slots are always freed.
 func (sl *StreamLimiter) ServeFileWithLimit(ctx context.Context, w http.ResponseWriter, r *http.Request, filePath string) bool {
 	if !sl.Acquire(ctx, filePath) {
 		return false
 	}
 
-	defer sl.Release(filePath)
+	// Use sync.Once to ensure we only release once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			sl.Release(filePath)
+		})
+	}
+
+	// Always release on function exit
+	defer release()
+
+	// Monitor context cancellation in a goroutine to release slot immediately
+	// when client disconnects (important for external apps)
+	go func() {
+		<-ctx.Done()
+		release()
+	}()
+
+	// Serve the file - this will return when complete or client disconnects
 	http.ServeFile(w, r, filePath)
 	return true
 }
